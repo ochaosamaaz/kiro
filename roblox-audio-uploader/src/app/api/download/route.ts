@@ -1,10 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server'
-import ytdl from '@distube/ytdl-core'
 import { writeFile, mkdir } from 'fs/promises'
 import { existsSync } from 'fs'
 import path from 'path'
 import { v4 as uuidv4 } from 'uuid'
+import { exec } from 'child_process'
+import { promisify } from 'util'
 
+const execAsync = promisify(exec)
 const TEMP_DIR = '/tmp/roblox-audio'
 
 async function ensureTempDir() {
@@ -25,8 +27,8 @@ export async function POST(request: NextRequest) {
     }
 
     // Check if it's a YouTube URL
-    if (ytdl.validateURL(url)) {
-      return await downloadFromYouTube(url)
+    if (url.match(/(?:youtube\.com|youtu\.be)/)) {
+      return await downloadWithYtDlp(url)
     }
 
     // For direct audio URLs
@@ -34,10 +36,8 @@ export async function POST(request: NextRequest) {
       return await downloadDirectAudio(url)
     }
 
-    return NextResponse.json(
-      { error: 'URL tidak valid. Gunakan YouTube URL atau direct audio URL' },
-      { status: 400 }
-    )
+    // Try yt-dlp for other supported sites (SoundCloud, etc.)
+    return await downloadWithYtDlp(url)
   } catch (error: any) {
     console.error('Download error:', error)
     return NextResponse.json(
@@ -47,62 +47,76 @@ export async function POST(request: NextRequest) {
   }
 }
 
-async function downloadFromYouTube(url: string) {
+async function downloadWithYtDlp(url: string) {
   await ensureTempDir()
-  
-  const info = await ytdl.getInfo(url)
-  const videoDetails = info.videoDetails
 
-  // Get audio-only format
-  const audioFormats = ytdl.filterFormats(info.formats, 'audioonly')
-  
-  if (audioFormats.length === 0) {
-    throw new Error('Tidak ada format audio yang tersedia')
-  }
-
-  // Prefer mp3/m4a format with reasonable quality
-  const audioFormat = audioFormats.find(f => 
-    f.audioQuality === 'AUDIO_QUALITY_MEDIUM' || 
-    f.audioQuality === 'AUDIO_QUALITY_LOW'
-  ) || audioFormats[0]
-
-  // Download the audio
-  const audioBuffer = await new Promise<Buffer>((resolve, reject) => {
-    const chunks: Buffer[] = []
-    const stream = ytdl(url, { format: audioFormat })
-    
-    stream.on('data', (chunk: Buffer) => chunks.push(chunk))
-    stream.on('end', () => resolve(Buffer.concat(chunks)))
-    stream.on('error', reject)
-  })
-
-  // Save to temp file
   const fileId = uuidv4()
-  const fileName = `${fileId}.mp3`
-  const filePath = path.join(TEMP_DIR, fileName)
-  
-  await writeFile(filePath, audioBuffer)
+  const outputPath = path.join(TEMP_DIR, `${fileId}.mp3`)
 
-  // Check Roblox audio limits (max 7 minutes / 420 seconds for free users)
-  const duration = parseInt(videoDetails.lengthSeconds)
-  if (duration > 420) {
-    console.warn('Warning: Audio longer than 7 minutes may require Roblox Premium')
+  try {
+    // First, get video info
+    const { stdout: infoJson } = await execAsync(
+      `yt-dlp --dump-json --no-download "${url}"`,
+      { timeout: 30000 }
+    )
+
+    const info = JSON.parse(infoJson)
+
+    // Download audio only, convert to mp3
+    await execAsync(
+      `yt-dlp -x --audio-format mp3 --audio-quality 5 -o "${outputPath}" "${url}"`,
+      { timeout: 120000 }
+    )
+
+    // Check if file exists (yt-dlp might add extension)
+    let finalPath = outputPath
+    if (!existsSync(finalPath)) {
+      // yt-dlp sometimes outputs with different extension
+      const possiblePaths = [
+        outputPath,
+        outputPath.replace('.mp3', '.mp3.mp3'),
+        path.join(TEMP_DIR, `${fileId}.mp3`)
+      ]
+      for (const p of possiblePaths) {
+        if (existsSync(p)) {
+          finalPath = p
+          break
+        }
+      }
+    }
+
+    const { size } = await import('fs').then(fs => fs.statSync(finalPath))
+
+    // Check Roblox audio limits (max 7 minutes for free)
+    const duration = info.duration || 0
+    if (duration > 420) {
+      console.warn('Warning: Audio longer than 7 minutes may require Roblox Premium')
+    }
+
+    return NextResponse.json({
+      title: info.title || 'Unknown',
+      duration: duration,
+      thumbnail: info.thumbnail || '',
+      author: info.uploader || info.channel || 'Unknown',
+      fileSize: size,
+      filePath: finalPath,
+      fileId: fileId
+    })
+  } catch (error: any) {
+    // If yt-dlp is not installed, provide helpful error
+    if (error.message?.includes('not found') || error.message?.includes('ENOENT')) {
+      return NextResponse.json(
+        { error: 'yt-dlp belum terinstall. Jalankan: pip install yt-dlp atau download dari https://github.com/yt-dlp/yt-dlp' },
+        { status: 500 }
+      )
+    }
+    throw error
   }
-
-  return NextResponse.json({
-    title: videoDetails.title,
-    duration: duration,
-    thumbnail: videoDetails.thumbnails[videoDetails.thumbnails.length - 1]?.url || '',
-    author: videoDetails.author.name,
-    fileSize: audioBuffer.length,
-    filePath: filePath,
-    fileId: fileId
-  })
 }
 
 async function downloadDirectAudio(url: string) {
   await ensureTempDir()
-  
+
   const response = await fetch(url)
   if (!response.ok) {
     throw new Error('Gagal mengunduh file audio')
@@ -116,7 +130,7 @@ async function downloadDirectAudio(url: string) {
   const extension = url.match(/\.(mp3|ogg|wav|m4a)/i)?.[1] || 'mp3'
   const fileName = `${fileId}.${extension}`
   const filePath = path.join(TEMP_DIR, fileName)
-  
+
   await writeFile(filePath, buffer)
 
   // Extract filename from URL

@@ -1,8 +1,4 @@
 /** @type {import('next').NextConfig} */
-const nextConfig = {
-  experimental: {
-    serverComponentsExternalPackages: ['fluent-ffmpeg', '@distube/ytdl-core']
-  }
-}
+const nextConfig = {}
 
 module.exports = nextConfig
