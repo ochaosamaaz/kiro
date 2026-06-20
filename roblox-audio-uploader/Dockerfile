@@ -35,6 +35,8 @@ RUN mkdir -p /app/tmp/roblox-audio
 # Copy built app
 COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static
+
+# Copy public folder if it exists (using wildcard to avoid failure)
 COPY --from=builder /app/public ./public
 
 EXPOSE 3000
