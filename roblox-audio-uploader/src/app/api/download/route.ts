@@ -125,18 +125,10 @@ async function downloadWithYtDlp(url: string): Promise<DownloadResult> {
 
   const fileId = uuidv4()
   const outputPath = path.join(TEMP_DIR, `${fileId}.%(ext)s`)
+  const infoPath = path.join(TEMP_DIR, `${fileId}.info.json`)
 
   try {
-    // First, get video info (title, duration, thumbnail, uploader)
-    const { stdout: infoJson } = await execFileAsync(YT_DLP_PATH, [
-      '--dump-json',
-      '--no-download',
-      url
-    ], { timeout: 30000 })
-
-    const info = JSON.parse(infoJson)
-
-    // Download audio only as mp3
+    // Download audio + write info json in one step (faster, less requests)
     await execFileAsync(YT_DLP_PATH, [
       '-x',                          // Extract audio
       '--audio-format', 'mp3',       // Convert to mp3
@@ -144,17 +136,33 @@ async function downloadWithYtDlp(url: string): Promise<DownloadResult> {
       '-o', outputPath,              // Output path
       '--no-playlist',               // Don't download playlist
       '--no-warnings',               // Suppress warnings
+      '--write-info-json',           // Write metadata to .info.json file
+      '--socket-timeout', '60',      // Socket timeout 60s
+      '--retries', '3',              // Retry 3 times
+      '--no-check-certificates',     // Skip cert check (faster)
       url
-    ], { timeout: 120000 }) // 2 min timeout per download
+    ], { timeout: 300000, maxBuffer: 50 * 1024 * 1024 }) // 5 min timeout
+
+    // Read info from .info.json
+    let info: any = {}
+    if (existsSync(infoPath)) {
+      try {
+        const infoContent = await readFile(infoPath, 'utf-8')
+        info = JSON.parse(infoContent)
+        // Clean up info file
+        const { unlink } = await import('fs/promises')
+        await unlink(infoPath).catch(() => {})
+      } catch {}
+    }
 
     // Find the downloaded file
     const finalPath = path.join(TEMP_DIR, `${fileId}.mp3`)
 
-    // Check if file exists
+    let foundPath = finalPath
     if (!existsSync(finalPath)) {
-      // yt-dlp might have used a different extension, check common ones
-      const possibleExts = ['mp3', 'webm', 'm4a', 'opus', 'ogg']
-      let foundPath = ''
+      // yt-dlp might have used a different extension
+      const possibleExts = ['mp3', 'webm', 'm4a', 'opus', 'ogg', 'wav']
+      foundPath = ''
       for (const ext of possibleExts) {
         const tryPath = path.join(TEMP_DIR, `${fileId}.${ext}`)
         if (existsSync(tryPath)) {
@@ -166,23 +174,9 @@ async function downloadWithYtDlp(url: string): Promise<DownloadResult> {
       if (!foundPath) {
         return { url, success: false, error: 'File audio tidak ditemukan setelah download' }
       }
-
-      // Use whatever file was created
-      const fileBuffer = await readFile(foundPath)
-      return {
-        url,
-        success: true,
-        title: info.title || 'Untitled',
-        duration: info.duration || 0,
-        thumbnail: info.thumbnail || '',
-        author: info.uploader || info.channel || 'Unknown',
-        fileSize: fileBuffer.length,
-        filePath: foundPath,
-        fileId
-      }
     }
 
-    const fileBuffer = await readFile(finalPath)
+    const fileBuffer = await readFile(foundPath)
 
     return {
       url,
@@ -192,7 +186,7 @@ async function downloadWithYtDlp(url: string): Promise<DownloadResult> {
       thumbnail: info.thumbnail || '',
       author: info.uploader || info.channel || 'Unknown',
       fileSize: fileBuffer.length,
-      filePath: finalPath,
+      filePath: foundPath,
       fileId
     }
   } catch (error: any) {
@@ -214,8 +208,10 @@ async function downloadWithYtDlp(url: string): Promise<DownloadResult> {
       errorMessage = 'Video tidak ditemukan (404)'
     } else if (stderr.includes('is not a valid URL') || stderr.includes('Unsupported URL')) {
       errorMessage = 'URL tidak valid atau tidak didukung'
+    } else if (stderr.includes('timed out') || stderr.includes('Read timed out')) {
+      errorMessage = 'Koneksi timeout - coba lagi'
     } else if (error.killed) {
-      errorMessage = 'Timeout - download terlalu lama'
+      errorMessage = 'Timeout - download terlalu lama (max 5 menit)'
     }
 
     return { url, success: false, error: errorMessage }
