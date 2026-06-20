@@ -1,11 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server'
-import ytdl from '@distube/ytdl-core'
-import { writeFile, mkdir } from 'fs/promises'
+import { execFile } from 'child_process'
+import { writeFile, mkdir, readFile } from 'fs/promises'
 import { existsSync } from 'fs'
 import path from 'path'
 import { v4 as uuidv4 } from 'uuid'
+import { promisify } from 'util'
 
-const TEMP_DIR = '/tmp/roblox-audio'
+const execFileAsync = promisify(execFile)
+
+const TEMP_DIR = path.join(process.cwd(), 'tmp', 'roblox-audio')
+
+// yt-dlp binary path - change this if yt-dlp is not in PATH
+// Windows example: 'D:\\yt-dlp\\yt-dlp.exe'
+// Linux/Mac (if in PATH): 'yt-dlp'
+const YT_DLP_PATH = process.env.YT_DLP_PATH || 'yt-dlp'
 
 async function ensureTempDir() {
   if (!existsSync(TEMP_DIR)) {
@@ -26,7 +34,6 @@ export interface DownloadResult {
   error?: string
 }
 
-// Single URL download (backward compatible)
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json()
@@ -46,20 +53,29 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    // Check if it's a YouTube URL
-    if (ytdl.validateURL(url)) {
-      return await downloadFromYouTube(url)
-    }
-
-    // For direct audio URLs
+    // For direct audio URLs (no need yt-dlp)
     if (url.match(/\.(mp3|ogg|wav|m4a)(\?.*)?$/i)) {
       return await downloadDirectAudio(url)
     }
 
-    return NextResponse.json(
-      { error: 'URL tidak valid. Gunakan YouTube URL atau direct audio URL' },
-      { status: 400 }
-    )
+    // Use yt-dlp for YouTube and other supported sites
+    const result = await downloadWithYtDlp(url)
+    if (result.success) {
+      return NextResponse.json({
+        title: result.title,
+        duration: result.duration,
+        thumbnail: result.thumbnail,
+        author: result.author,
+        fileSize: result.fileSize,
+        filePath: result.filePath,
+        fileId: result.fileId
+      })
+    } else {
+      return NextResponse.json(
+        { error: result.error || 'Gagal mengunduh audio' },
+        { status: 500 }
+      )
+    }
   } catch (error: any) {
     console.error('Download error:', error)
     return NextResponse.json(
@@ -70,7 +86,6 @@ export async function POST(request: NextRequest) {
 }
 
 async function handleBulkDownload(urls: string[]): Promise<NextResponse> {
-  // Max 20 URLs per batch
   const MAX_URLS = 20
   const uniqueUrls = Array.from(new Set(urls.filter(u => u.trim()))).slice(0, MAX_URLS)
 
@@ -85,18 +100,13 @@ async function handleBulkDownload(urls: string[]): Promise<NextResponse> {
 
   for (const url of uniqueUrls) {
     try {
-      if (ytdl.validateURL(url)) {
-        const result = await downloadFromYouTubeBulk(url)
-        results.push(result)
-      } else if (url.match(/\.(mp3|ogg|wav|m4a)(\?.*)?$/i)) {
+      if (url.match(/\.(mp3|ogg|wav|m4a)(\?.*)?$/i)) {
         const result = await downloadDirectAudioBulk(url)
         results.push(result)
       } else {
-        results.push({
-          url,
-          success: false,
-          error: 'URL tidak valid'
-        })
+        // Use yt-dlp for everything else (YouTube, SoundCloud, etc.)
+        const result = await downloadWithYtDlp(url)
+        results.push(result)
       }
     } catch (error: any) {
       results.push({
@@ -110,55 +120,138 @@ async function handleBulkDownload(urls: string[]): Promise<NextResponse> {
   return NextResponse.json({ results })
 }
 
-async function downloadFromYouTubeBulk(url: string): Promise<DownloadResult> {
+async function downloadWithYtDlp(url: string): Promise<DownloadResult> {
   await ensureTempDir()
 
+  const fileId = uuidv4()
+  const outputPath = path.join(TEMP_DIR, `${fileId}.%(ext)s`)
+
   try {
-    const info = await ytdl.getInfo(url)
-    const videoDetails = info.videoDetails
+    // First, get video info (title, duration, thumbnail, uploader)
+    const { stdout: infoJson } = await execFileAsync(YT_DLP_PATH, [
+      '--dump-json',
+      '--no-download',
+      url
+    ], { timeout: 30000 })
 
-    const audioFormats = ytdl.filterFormats(info.formats, 'audioonly')
+    const info = JSON.parse(infoJson)
 
-    if (audioFormats.length === 0) {
-      return { url, success: false, error: 'Tidak ada format audio yang tersedia' }
+    // Download audio only as mp3
+    await execFileAsync(YT_DLP_PATH, [
+      '-x',                          // Extract audio
+      '--audio-format', 'mp3',       // Convert to mp3
+      '--audio-quality', '5',        // Medium quality (0=best, 10=worst)
+      '-o', outputPath,              // Output path
+      '--no-playlist',               // Don't download playlist
+      '--no-warnings',               // Suppress warnings
+      url
+    ], { timeout: 120000 }) // 2 min timeout per download
+
+    // Find the downloaded file
+    const finalPath = path.join(TEMP_DIR, `${fileId}.mp3`)
+
+    // Check if file exists
+    if (!existsSync(finalPath)) {
+      // yt-dlp might have used a different extension, check common ones
+      const possibleExts = ['mp3', 'webm', 'm4a', 'opus', 'ogg']
+      let foundPath = ''
+      for (const ext of possibleExts) {
+        const tryPath = path.join(TEMP_DIR, `${fileId}.${ext}`)
+        if (existsSync(tryPath)) {
+          foundPath = tryPath
+          break
+        }
+      }
+
+      if (!foundPath) {
+        return { url, success: false, error: 'File audio tidak ditemukan setelah download' }
+      }
+
+      // Use whatever file was created
+      const fileBuffer = await readFile(foundPath)
+      return {
+        url,
+        success: true,
+        title: info.title || 'Untitled',
+        duration: info.duration || 0,
+        thumbnail: info.thumbnail || '',
+        author: info.uploader || info.channel || 'Unknown',
+        fileSize: fileBuffer.length,
+        filePath: foundPath,
+        fileId
+      }
     }
 
-    const audioFormat = audioFormats.find(f =>
-      f.audioQuality === 'AUDIO_QUALITY_MEDIUM' ||
-      f.audioQuality === 'AUDIO_QUALITY_LOW'
-    ) || audioFormats[0]
-
-    const audioBuffer = await new Promise<Buffer>((resolve, reject) => {
-      const chunks: Buffer[] = []
-      const stream = ytdl(url, { format: audioFormat })
-
-      stream.on('data', (chunk: Buffer) => chunks.push(chunk))
-      stream.on('end', () => resolve(Buffer.concat(chunks)))
-      stream.on('error', reject)
-    })
-
-    const fileId = uuidv4()
-    const fileName = `${fileId}.mp3`
-    const filePath = path.join(TEMP_DIR, fileName)
-
-    await writeFile(filePath, audioBuffer)
-
-    const duration = parseInt(videoDetails.lengthSeconds)
+    const fileBuffer = await readFile(finalPath)
 
     return {
       url,
       success: true,
-      title: videoDetails.title,
-      duration,
-      thumbnail: videoDetails.thumbnails[videoDetails.thumbnails.length - 1]?.url || '',
-      author: videoDetails.author.name,
-      fileSize: audioBuffer.length,
-      filePath,
+      title: info.title || 'Untitled',
+      duration: info.duration || 0,
+      thumbnail: info.thumbnail || '',
+      author: info.uploader || info.channel || 'Unknown',
+      fileSize: fileBuffer.length,
+      filePath: finalPath,
       fileId
     }
   } catch (error: any) {
-    return { url, success: false, error: error.message || 'Gagal download dari YouTube' }
+    console.error('yt-dlp error for', url, ':', error.message || error)
+
+    // Parse common yt-dlp errors
+    let errorMessage = 'Gagal download'
+    const stderr = error.stderr || error.message || ''
+
+    if (stderr.includes('Video unavailable') || stderr.includes('is not available')) {
+      errorMessage = 'Video tidak tersedia'
+    } else if (stderr.includes('Private video')) {
+      errorMessage = 'Video bersifat private'
+    } else if (stderr.includes('Sign in to confirm your age')) {
+      errorMessage = 'Video memerlukan verifikasi umur'
+    } else if (stderr.includes('HTTP Error 403')) {
+      errorMessage = 'Akses ditolak (403)'
+    } else if (stderr.includes('HTTP Error 404')) {
+      errorMessage = 'Video tidak ditemukan (404)'
+    } else if (stderr.includes('is not a valid URL') || stderr.includes('Unsupported URL')) {
+      errorMessage = 'URL tidak valid atau tidak didukung'
+    } else if (error.killed) {
+      errorMessage = 'Timeout - download terlalu lama'
+    }
+
+    return { url, success: false, error: errorMessage }
   }
+}
+
+async function downloadDirectAudio(url: string) {
+  await ensureTempDir()
+
+  const response = await fetch(url)
+  if (!response.ok) {
+    throw new Error('Gagal mengunduh file audio')
+  }
+
+  const arrayBuffer = await response.arrayBuffer()
+  const buffer = Buffer.from(arrayBuffer)
+
+  const fileId = uuidv4()
+  const extension = url.match(/\.(mp3|ogg|wav|m4a)/i)?.[1] || 'mp3'
+  const fileName = `${fileId}.${extension}`
+  const filePath = path.join(TEMP_DIR, fileName)
+
+  await writeFile(filePath, buffer)
+
+  const urlParts = url.split('/')
+  const originalName = urlParts[urlParts.length - 1].split('?')[0]
+
+  return NextResponse.json({
+    title: decodeURIComponent(originalName.replace(/\.(mp3|ogg|wav|m4a)$/i, '')),
+    duration: 0,
+    thumbnail: '',
+    author: 'Direct Download',
+    fileSize: buffer.length,
+    filePath: filePath,
+    fileId: fileId
+  })
 }
 
 async function downloadDirectAudioBulk(url: string): Promise<DownloadResult> {
@@ -197,85 +290,4 @@ async function downloadDirectAudioBulk(url: string): Promise<DownloadResult> {
   } catch (error: any) {
     return { url, success: false, error: error.message || 'Gagal download' }
   }
-}
-
-// Original single-download functions (kept for backward compatibility)
-async function downloadFromYouTube(url: string) {
-  await ensureTempDir()
-
-  const info = await ytdl.getInfo(url)
-  const videoDetails = info.videoDetails
-
-  const audioFormats = ytdl.filterFormats(info.formats, 'audioonly')
-
-  if (audioFormats.length === 0) {
-    throw new Error('Tidak ada format audio yang tersedia')
-  }
-
-  const audioFormat = audioFormats.find(f =>
-    f.audioQuality === 'AUDIO_QUALITY_MEDIUM' ||
-    f.audioQuality === 'AUDIO_QUALITY_LOW'
-  ) || audioFormats[0]
-
-  const audioBuffer = await new Promise<Buffer>((resolve, reject) => {
-    const chunks: Buffer[] = []
-    const stream = ytdl(url, { format: audioFormat })
-
-    stream.on('data', (chunk: Buffer) => chunks.push(chunk))
-    stream.on('end', () => resolve(Buffer.concat(chunks)))
-    stream.on('error', reject)
-  })
-
-  const fileId = uuidv4()
-  const fileName = `${fileId}.mp3`
-  const filePath = path.join(TEMP_DIR, fileName)
-
-  await writeFile(filePath, audioBuffer)
-
-  const duration = parseInt(videoDetails.lengthSeconds)
-  if (duration > 420) {
-    console.warn('Warning: Audio longer than 7 minutes may require Roblox Premium')
-  }
-
-  return NextResponse.json({
-    title: videoDetails.title,
-    duration: duration,
-    thumbnail: videoDetails.thumbnails[videoDetails.thumbnails.length - 1]?.url || '',
-    author: videoDetails.author.name,
-    fileSize: audioBuffer.length,
-    filePath: filePath,
-    fileId: fileId
-  })
-}
-
-async function downloadDirectAudio(url: string) {
-  await ensureTempDir()
-
-  const response = await fetch(url)
-  if (!response.ok) {
-    throw new Error('Gagal mengunduh file audio')
-  }
-
-  const arrayBuffer = await response.arrayBuffer()
-  const buffer = Buffer.from(arrayBuffer)
-
-  const fileId = uuidv4()
-  const extension = url.match(/\.(mp3|ogg|wav|m4a)/i)?.[1] || 'mp3'
-  const fileName = `${fileId}.${extension}`
-  const filePath = path.join(TEMP_DIR, fileName)
-
-  await writeFile(filePath, buffer)
-
-  const urlParts = url.split('/')
-  const originalName = urlParts[urlParts.length - 1].split('?')[0]
-
-  return NextResponse.json({
-    title: decodeURIComponent(originalName.replace(/\.(mp3|ogg|wav|m4a)$/i, '')),
-    duration: 0,
-    thumbnail: '',
-    author: 'Direct Download',
-    fileSize: buffer.length,
-    filePath: filePath,
-    fileId: fileId
-  })
 }
