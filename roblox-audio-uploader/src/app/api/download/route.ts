@@ -127,6 +127,18 @@ async function downloadWithYtDlp(url: string): Promise<DownloadResult> {
   const outputPath = path.join(TEMP_DIR, `${fileId}.%(ext)s`)
   const infoPath = path.join(TEMP_DIR, `${fileId}.info.json`)
 
+  // Strip playlist parameters from YouTube URLs to avoid issues
+  let cleanUrl = url
+  try {
+    const urlObj = new URL(url)
+    if (urlObj.hostname.includes('youtube.com') || urlObj.hostname.includes('youtu.be')) {
+      urlObj.searchParams.delete('list')
+      urlObj.searchParams.delete('index')
+      urlObj.searchParams.delete('start_radio')
+      cleanUrl = urlObj.toString()
+    }
+  } catch {}
+
   try {
     // Download audio + write info json in one step (faster, less requests)
     await execFileAsync(YT_DLP_PATH, [
@@ -140,7 +152,9 @@ async function downloadWithYtDlp(url: string): Promise<DownloadResult> {
       '--socket-timeout', '60',      // Socket timeout 60s
       '--retries', '3',              // Retry 3 times
       '--no-check-certificates',     // Skip cert check (faster)
-      url
+      '--extractor-retries', '3',    // Retry extractor 3 times
+      '--force-ipv4',                // Force IPv4 (more reliable on servers)
+      cleanUrl
     ], { timeout: 300000, maxBuffer: 50 * 1024 * 1024 }) // 5 min timeout
 
     // Read info from .info.json
