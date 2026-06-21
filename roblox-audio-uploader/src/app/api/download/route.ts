@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { execFile } from 'child_process'
-import { writeFile, mkdir, readFile } from 'fs/promises'
+import { writeFile, mkdir, readFile, unlink } from 'fs/promises'
 import { existsSync } from 'fs'
 import path from 'path'
 import { v4 as uuidv4 } from 'uuid'
@@ -9,16 +9,29 @@ import { promisify } from 'util'
 const execFileAsync = promisify(execFile)
 
 const TEMP_DIR = path.join(process.cwd(), 'tmp', 'roblox-audio')
+const COOKIES_PATH = path.join(process.cwd(), 'tmp', 'cookies.txt')
 
 // yt-dlp binary path - change this if yt-dlp is not in PATH
-// Windows example: 'D:\\yt-dlp\\yt-dlp.exe'
-// Linux/Mac (if in PATH): 'yt-dlp'
 const YT_DLP_PATH = process.env.YT_DLP_PATH || 'yt-dlp'
 
 async function ensureTempDir() {
   if (!existsSync(TEMP_DIR)) {
     await mkdir(TEMP_DIR, { recursive: true })
   }
+}
+
+// Write cookies from env variable to file (for yt-dlp --cookies flag)
+async function ensureCookiesFile(): Promise<string | null> {
+  const cookies = process.env.YOUTUBE_COOKIES
+  if (!cookies) return null
+
+  await ensureTempDir()
+  
+  if (!existsSync(COOKIES_PATH)) {
+    await writeFile(COOKIES_PATH, cookies, 'utf-8')
+  }
+  
+  return COOKIES_PATH
 }
 
 export interface DownloadResult {
@@ -140,8 +153,11 @@ async function downloadWithYtDlp(url: string): Promise<DownloadResult> {
   } catch {}
 
   try {
-    // Download audio + write info json in one step (faster, less requests)
-    await execFileAsync(YT_DLP_PATH, [
+    // Get cookies file path if available
+    const cookiesFile = await ensureCookiesFile()
+
+    // Build yt-dlp arguments
+    const args = [
       '-x',                          // Extract audio
       '--audio-format', 'mp3',       // Convert to mp3
       '--audio-quality', '5',        // Medium quality (0=best, 10=worst)
@@ -154,8 +170,17 @@ async function downloadWithYtDlp(url: string): Promise<DownloadResult> {
       '--no-check-certificates',     // Skip cert check (faster)
       '--extractor-retries', '3',    // Retry extractor 3 times
       '--force-ipv4',                // Force IPv4 (more reliable on servers)
-      cleanUrl
-    ], { timeout: 300000, maxBuffer: 50 * 1024 * 1024 }) // 5 min timeout
+    ]
+
+    // Add cookies if available
+    if (cookiesFile) {
+      args.push('--cookies', cookiesFile)
+    }
+
+    args.push(cleanUrl)
+
+    // Download audio + write info json in one step (faster, less requests)
+    await execFileAsync(YT_DLP_PATH, args, { timeout: 300000, maxBuffer: 50 * 1024 * 1024 }) // 5 min timeout
 
     // Read info from .info.json
     let info: any = {}
