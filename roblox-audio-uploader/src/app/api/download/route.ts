@@ -172,12 +172,15 @@ async function downloadWithYtDlp(url: string): Promise<DownloadResult> {
       '--force-ipv4',                // Force IPv4 (more reliable on servers)
     ]
 
-    // Add cookies - use browser cookies locally, file cookies on server
+    // Add cookies - use file cookies (local or server)
     if (cookiesFile) {
       args.push('--cookies', cookiesFile)
     } else if (!process.env.RAILWAY_ENVIRONMENT && !process.env.RAILWAY_SERVICE_ID) {
-      // Running locally - use cookies from browser
-      args.push('--cookies-from-browser', 'chrome')
+      // Running locally - check for cookies.txt in project root
+      const localCookies = path.join(process.cwd(), 'cookies.txt')
+      if (existsSync(localCookies)) {
+        args.push('--cookies', localCookies)
+      }
     }
 
     args.push(cleanUrl)
