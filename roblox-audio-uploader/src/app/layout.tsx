@@ -1,12 +1,13 @@
 import type { Metadata } from 'next'
-import { Inter } from 'next/font/google'
+import { Inter, JetBrains_Mono } from 'next/font/google'
 import './globals.css'
 
-const inter = Inter({ subsets: ['latin'] })
+const inter = Inter({ subsets: ['latin'], variable: '--font-inter' })
+const jetbrains = JetBrains_Mono({ subsets: ['latin'], variable: '--font-mono' })
 
 export const metadata: Metadata = {
-  title: 'Roblox Audio Uploader',
-  description: 'Download lagu dan upload langsung ke Roblox',
+  title: 'SoundCiel — Roblox Audio Tool',
+  description: 'Download YouTube, konversi ke MP3/OGG, dan upload langsung ke Roblox via Open Cloud API.',
 }
 
 export default function RootLayout({
@@ -16,7 +17,7 @@ export default function RootLayout({
 }) {
   return (
     <html lang="id">
-      <body className={inter.className}>{children}</body>
+      <body className={`${inter.variable} ${jetbrains.variable} font-sans`}>{children}</body>
     </html>
   )
 }
