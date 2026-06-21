@@ -7,11 +7,9 @@ module.exports = {
   ],
   theme: {
     extend: {
-      colors: {
-        'roblox-red': '#e2231a',
-        'roblox-dark': '#1a1a2e',
-        'roblox-darker': '#16213e',
-        'roblox-accent': '#0f3460',
+      fontFamily: {
+        sans: ['var(--font-inter)', 'system-ui', 'sans-serif'],
+        mono: ['var(--font-mono)', 'JetBrains Mono', 'monospace'],
       },
     },
   },
