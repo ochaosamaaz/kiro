@@ -118,7 +118,7 @@ export default function Home() {
     setItems(initialItems)
 
     try {
-      const response = await axios.post('/api/download', { urls: uniqueUrls })
+      const response = await axios.post('/api/download', { urls: uniqueUrls }, { timeout: 600000 }) // 10 min timeout
       const results = response.data.results
 
       const updatedItems: AudioItem[] = initialItems.map((item, index) => {
